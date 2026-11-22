@@ -1,4 +1,4 @@
-"""自定义 UI 命中测试的核心桩。
+"""自定义 UI 命中测试的核心实现。
 
 节点是普通 ``dict``，字段约定如下（所有坐标均使用同一套二维坐标系，
 ``rot`` 为正时逆时针旋转，单位为弧度）::
@@ -22,7 +22,16 @@
 
 from __future__ import annotations
 
+import math
+
 EPS = 1e-9
+
+# 字段缺失时的默认值（与 validate_node 的契约一致）。
+_DEFAULT_POS = (0.0, 0.0)
+_DEFAULT_SIZE = (0.0, 0.0)
+_DEFAULT_ROT = 0.0
+_DEFAULT_SCALE = (1.0, 1.0)
+_DEFAULT_Z = 0
 
 
 def to_local(point, node):
@@ -45,7 +54,23 @@ def to_local(point, node):
     容差:
         数值比较使用 1e-9。
     """
-    raise NotImplementedError
+    px, py = node.get("pos", _DEFAULT_POS)
+    rot = node.get("rot", _DEFAULT_ROT)
+    sx, sy = node.get("scale", _DEFAULT_SCALE)
+
+    # 先撤销平移。
+    dx = point[0] - px
+    dy = point[1] - py
+
+    # 再撤销旋转：逆矩阵是 R(-rot)。
+    # R(-t) = [[cos t, sin t], [-sin t, cos t]]
+    cos_r = math.cos(rot)
+    sin_r = math.sin(rot)
+    rx = cos_r * dx + sin_r * dy
+    ry = -sin_r * dx + cos_r * dy
+
+    # 最后撤销缩放：正向是乘法，逆向必须是除法。
+    return rx / sx, ry / sy
 
 
 def in_rect(local, size):
@@ -61,7 +86,47 @@ def in_rect(local, size):
     返回:
         ``bool``。
     """
-    raise NotImplementedError
+    x, y = local
+    w, h = size
+    return bool(-EPS <= x <= w + EPS and -EPS <= y <= h + EPS)
+
+
+def _collect_hits(nodes, parent_point):
+    """先序遍历节点树，返回所有几何命中的 ``(z, 发现序, path, pass_through)``。
+
+    ``parent_point`` 是父坐标系中的查询点（顶层调用即世界坐标）。
+    隐藏节点及其整棵子树直接跳过。发现序用于同 z 时的稳定排序。
+    """
+    hits = []
+    counter = 0
+
+    def walk(children, point):
+        nonlocal counter
+        for node in children:
+            if not node.get("visible", True):
+                # 隐藏节点连同整棵子树一起排除，不再递归。
+                continue
+
+            local_point = to_local(point, node)
+            size = node.get("size", _DEFAULT_SIZE)
+            if in_rect(local_point, size):
+                hits.append(
+                    (
+                        node.get("z", _DEFAULT_Z),
+                        counter,
+                        node["path"],
+                        bool(node.get("pass_through", False)),
+                    )
+                )
+                counter += 1
+
+            # 无论自身是否命中，子节点仍可能命中（子矩形可以超出父矩形）。
+            walk(node.get("children", []), local_point)
+
+    walk(nodes, parent_point)
+    # z 从大到小；同 z 保持先序发现顺序（稳定排序）。
+    hits.sort(key=lambda item: (-item[0], item[1]))
+    return hits
 
 
 def hit_test(nodes, point):
@@ -91,7 +156,14 @@ def hit_test(nodes, point):
     容差:
         变换与边界比较均使用 1e-9。
     """
-    raise NotImplementedError
+    ordered = _collect_hits(nodes, point)
+    result = []
+    for _z, _index, path, is_pass_through in ordered:
+        result.append(path)
+        if not is_pass_through:
+            # 遮挡层计入结果后立即停止，后面的层级被挡住。
+            break
+    return result
 
 
 def clip_children(node):
@@ -122,7 +194,45 @@ def clip_children(node):
     容差:
         交集尺寸判断使用 1e-9。
     """
-    raise NotImplementedError
+    if "clip" in node:
+        clip_x, clip_y, clip_w, clip_h = node["clip"]
+    else:
+        clip_x, clip_y = 0.0, 0.0
+        clip_w, clip_h = node.get("size", _DEFAULT_SIZE)
+    clip_x1 = clip_x + clip_w
+    clip_y1 = clip_y + clip_h
+
+    result = []
+    for child in node.get("children", []):
+        px, py = child.get("pos", _DEFAULT_POS)
+        rot = child.get("rot", _DEFAULT_ROT)
+        sx, sy = child.get("scale", _DEFAULT_SCALE)
+        w, h = child.get("size", _DEFAULT_SIZE)
+        cos_r = math.cos(rot)
+        sin_r = math.sin(rot)
+
+        # 局部矩形四个角经正向变换 parent = pos + R(rot) @ (scale * local)
+        # 映射到父局部坐标，取轴对齐包围盒。
+        xs = []
+        ys = []
+        for lx, ly in ((0.0, 0.0), (w, 0.0), (0.0, h), (w, h)):
+            scaled_x = sx * lx
+            scaled_y = sy * ly
+            xs.append(px + cos_r * scaled_x - sin_r * scaled_y)
+            ys.append(py + sin_r * scaled_x + cos_r * scaled_y)
+        box_x0, box_x1 = min(xs), max(xs)
+        box_y0, box_y1 = min(ys), max(ys)
+
+        # 与父裁剪矩形求交集。
+        inter_x0 = max(clip_x, box_x0)
+        inter_y0 = max(clip_y, box_y0)
+        inter_x1 = min(clip_x1, box_x1)
+        inter_y1 = min(clip_y1, box_y1)
+
+        if inter_x1 - inter_x0 > EPS and inter_y1 - inter_y0 > EPS:
+            result.append((child["path"], (inter_x0, inter_y0, inter_x1, inter_y1)))
+
+    return result
 
 
 def z_order(nodes):
@@ -137,7 +247,8 @@ def z_order(nodes):
     返回:
         ``list``，元素仍是原节点字典。
     """
-    raise NotImplementedError
+    # Python 的 sorted 是稳定排序：key 相等时保持原顺序，且返回新列表。
+    return sorted(nodes, key=lambda item: -item.get("z", _DEFAULT_Z))
 
 
 def penetrate(nodes, point, pass_through):
@@ -164,7 +275,12 @@ def penetrate(nodes, point, pass_through):
     容差:
         变换与边界比较均使用 1e-9。
     """
-    raise NotImplementedError
+    ordered = _collect_hits(nodes, point)
+    paths = [path for _z, _index, path, _pt in ordered]
+    if pass_through:
+        return paths
+    # 非穿透模式只保留最上层的一个命中。
+    return paths[:1]
 
 
 def validate_node(node):
@@ -191,7 +307,39 @@ def validate_node(node):
     返回:
         ``list[str]``。
     """
-    raise NotImplementedError
+    found = set()
+    # 递归栈上的节点 id：只有回到栈中祖先才算环；DAG 共享不报环。
+    on_stack = set()
+
+    def walk(current):
+        current_id = id(current)
+        if current_id in on_stack:
+            found.add("cycle")
+            # 环已确认，剪枝终止，避免无限递归。
+            return
+        on_stack.add(current_id)
+
+        pos = current.get("pos", _DEFAULT_POS)
+        size = current.get("size", _DEFAULT_SIZE)
+        rot = current.get("rot", _DEFAULT_ROT)
+        scale = current.get("scale", _DEFAULT_SCALE)
+        z = current.get("z", _DEFAULT_Z)
+
+        numeric_values = [pos[0], pos[1], size[0], size[1], rot, scale[0], scale[1], z]
+        if any(isinstance(value, float) and math.isnan(value) for value in numeric_values):
+            found.add("nan")
+
+        if scale[0] == 0 or scale[1] == 0:
+            found.add("zero_scale")
+
+        for child in current.get("children", []):
+            walk(child)
+
+        on_stack.discard(current_id)
+
+    walk(node)
+
+    return [code for code in ("nan", "zero_scale", "cycle") if code in found]
 
 
 def hit_batch(frames, config):
@@ -218,4 +366,13 @@ def hit_batch(frames, config):
     返回:
         ``dict[int, list[str]]``。
     """
-    raise NotImplementedError
+    mode = config.get("mode", "hit")
+    results = {}
+    for index, frame in enumerate(frames):
+        # 每帧独立调用，不保留任何跨帧的矩阵/坐标缓存。
+        if mode == "penetrate":
+            pass_through = config.get("pass_through", True)
+            results[index] = penetrate(frame["nodes"], frame["point"], pass_through)
+        else:
+            results[index] = hit_test(frame["nodes"], frame["point"])
+    return results
